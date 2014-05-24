@@ -6,7 +6,6 @@ var crypto = require('crypto');
 var bitfield = require('bitfield');
 var parseTorrent = require('parse-torrent');
 var mkdirp = require('mkdirp');
-var rimraf = require('rimraf');
 var events = require('events');
 var path = require('path');
 var fs = require('fs');
@@ -26,6 +25,9 @@ var REQUEST_TIMEOUT = 30000;
 var SPEED_THRESHOLD = 3 * piece.BLOCK_SIZE;
 var DEFAULT_PORT = 6881;
 var DHT_SIZE = 10000;
+
+var RECHOKE_INTERVAL = 10000;
+var RECHOKE_OPTIMISTIC_DURATION = 2;
 
 var METADATA_BLOCK_SIZE = 1 << 14;
 var METADATA_MAX_SIZE = 1 << 22;
@@ -81,18 +83,32 @@ var torrentStream = function(link, opts) {
 
 	if (!opts) opts = {};
 	if (!opts.id) opts.id = '-TS0008-'+hat(48);
-	if (!opts.path) opts.path = path.join(opts.tmp || TMP, opts.name || 'torrent-stream', infoHash);
+	if (!opts.tmp) opts.tmp = TMP;
+	if (!opts.name) opts.name = 'torrent-stream';
 	if (!opts.blocklist) opts.blocklist = [];
 
+	var usingTmp = false;
+	var destroyed = false;
+
+	if (!opts.path) {
+		usingTmp = true;
+		opts.path = path.join(opts.tmp, opts.name, infoHash);
+	}
+
 	var engine = new events.EventEmitter();
-	var swarm = pws(infoHash, opts.id, {size:opts.connections || opts.size});
-	var torrentPath = path.join(opts.path, 'cache.torrent');
+	var swarm = pws(infoHash, opts.id, { size: (opts.connections || opts.size), speed: 10 });
+	var torrentPath = path.join(opts.tmp, opts.name, infoHash + '.torrent');
 
 	var wires = swarm.wires;
 	var critical = [];
 	var metadataPieces = [];
 	var metadata = null;
 	var refresh = noop;
+
+	var rechokeSlots = (opts.uploads === false || opts.uploads === 0) ? 0 : (+opts.uploads || 10);
+	var rechokeOptimistic = null;
+	var rechokeOptimisticTime = 0;
+	var rechokeIntervalId;
 
 	engine.path = opts.path;
 	engine.files = [];
@@ -120,6 +136,27 @@ var torrentStream = function(link, opts) {
 		table.findPeers(opts.dht || DHT_SIZE); // TODO: be smarter about finding peers
 	}
 
+	var createTracker = function(torrent) {
+		if (opts.trackers) {
+			torrent = Object.create(torrent);
+			var trackers = (opts.tracker !== false) && torrent.announce ? torrent.announce : [];
+			torrent.announce = trackers.concat(opts.trackers);
+		} else if (opts.tracker === false) {
+			return;
+		}
+
+		var tr = new tracker.Client(new Buffer(opts.id), engine.port || DEFAULT_PORT, torrent);
+
+		tr.on('peer', function(addr) {
+			engine.connect(addr);
+		});
+
+		tr.on('error', noop);
+
+		tr.start();
+		return tr;
+	};
+
 	var ontorrent = function(torrent) {
 		engine.store = storage(opts.path, torrent);
 		engine.torrent = torrent;
@@ -135,19 +172,23 @@ var torrentStream = function(link, opts) {
 			return [];
 		});
 
-		if (opts.tracker !== false) {
-			var tr = engine.tracker = new tracker.Client(new Buffer(opts.id), engine.port || DEFAULT_PORT, torrent);
-
-			tr.on('peer', function(addr) {
-				engine.connect(addr);
+		if (engine.tracker) {
+			/*
+			If we have tracker then it had been created before we got infoDictionary.
+			So client do not know torrent length and can not report right information about uploads
+			*/
+			engine.tracker.torrentLength = torrent.length;
+		} else {
+			process.nextTick(function() {
+				// let execute engine.listen() before createTracker()
+				if (!engine.tracker) {
+					engine.tracker = createTracker(torrent);
+				}
 			});
-
-			tr.on('error', noop);
-
-			tr.start();
 		}
 
-		torrent.files.forEach(function(file) {
+		engine.files = torrent.files.map(function(file) {
+			file = Object.create(file);
 			var offsetPiece = (file.offset / torrent.pieceLength) | 0;
 			var endPiece = ((file.offset+file.length-1) / torrent.pieceLength) | 0;
 
@@ -160,7 +201,6 @@ var torrentStream = function(link, opts) {
 			};
 
 			file.createReadStream = function(opts) {
-				var self = this;
 				var stream = fileStream(engine, file, opts);
 
 				engine.select(stream.startPiece, stream.endPiece, true, stream.notify.bind(stream));
@@ -171,7 +211,7 @@ var torrentStream = function(link, opts) {
 				return stream;
 			};
 
-			engine.files.push(file);
+			return file;
 		});
 
 		var oninterestchange = function() {
@@ -247,11 +287,11 @@ var torrentStream = function(link, opts) {
 
 			if (!min) return false;
 
-			for (var i = 0; i < r.length; i++) {
+			for (i = 0; i < r.length; i++) {
 				if (r[i] === min) r[i] = null;
 			}
 
-			for (var i = 0; i < min.requests.length; i++) {
+			for (i = 0; i < min.requests.length; i++) {
 				var req = min.requests[i];
 				if (req.piece !== index) continue;
 				pieces[index].cancel((req.offset / piece.BLOCK_SIZE) | 0);
@@ -327,8 +367,7 @@ var torrentStream = function(link, opts) {
 			var speed = wire.downloadSpeed() || 1;
 			if (speed > SPEED_THRESHOLD) return thruthy;
 
-			// we +1 here be on the safe side. rather buffer to much than to little
-			var secs = (1+MAX_REQUESTS) * piece.BLOCK_SIZE / speed;
+			var secs = MAX_REQUESTS * piece.BLOCK_SIZE / speed;
 			var tries = 10;
 			var ptr = 0;
 
@@ -340,7 +379,8 @@ var torrentStream = function(link, opts) {
 					var other = wires[ptr];
 					var otherSpeed = other.downloadSpeed();
 
-					if (otherSpeed < speed || !other.peerPieces[index]) continue;
+					if (otherSpeed < SPEED_THRESHOLD) continue;
+					if (otherSpeed <= speed || !other.peerPieces[index]) continue;
 					if ((missing -= otherSpeed * secs) > 0) continue;
 
 					tries--;
@@ -421,10 +461,10 @@ var torrentStream = function(link, opts) {
 
 			wire.on('request', function(index, offset, length, cb) {
 				if (pieces[index]) return;
-				engine.store.read(index, function(err, buffer) {
+				engine.store.read(index, { offset: offset, length: length }, function(err, buffer) {
 					if (err) return cb(err);
 					engine.emit('upload', index, offset, length);
-					cb(null, buffer.slice(offset, offset+length));
+					cb(null, buffer);
 				});
 			});
 
@@ -432,11 +472,83 @@ var torrentStream = function(link, opts) {
 			wire.on('bitfield', onupdate);
 			wire.on('have', onupdate);
 
-			wire.once('interested', function() {
-				wire.unchoke();
-			});
+			wire.isSeeder = false;
+
+			var i = 0;
+			var checkseeder = function() {
+				if (wire.peerPieces.length !== torrent.pieces.length) return;
+				for (; i < torrent.pieces.length; ++i) {
+					if (!wire.peerPieces[i]) return;
+				}
+				wire.isSeeder = true;
+			};
+
+			wire.on('bitfield', checkseeder);
+			wire.on('have', checkseeder);
+			checkseeder();
 
 			id = setTimeout(onchoketimeout, timeout);
+		};
+
+		var rechokeSort = function(a, b) {
+			// Prefer higher download speed
+			if (a.downSpeed != b.downSpeed) return a.downSpeed > b.downSpeed ? -1 : 1;
+			// Prefer higher upload speed
+			if (a.upSpeed != b.upSpeed) return a.upSpeed > b.upSpeed ? -1 : 1;
+			// Prefer unchoked
+			if (a.wasChoked != b.wasChoked) return a.wasChoked ? 1 : -1;
+			// Random order
+			return a.salt - b.salt;
+		};
+
+		var onrechoke = function() {
+			if (rechokeOptimisticTime > 0) --rechokeOptimisticTime;
+			else rechokeOptimistic = null;
+
+			var peers = [];
+
+			wires.forEach(function(wire) {
+				if (wire.isSeeder) {
+					if (!wire.amChoking) wire.choke();
+				} else if (wire !== rechokeOptimistic) {
+					peers.push({
+						wire:       wire,
+						downSpeed:  wire.downloadSpeed(),
+						upSpeed:    wire.uploadSpeed(),
+						salt:       Math.random(),
+						interested: wire.peerInterested,
+						wasChoked:  wire.amChoking,
+						isChoked:   true
+					});
+				}
+			});
+
+			peers.sort(rechokeSort);
+
+			var i = 0;
+			var unchokeInterested = 0;
+			for (; i < peers.length && unchokeInterested < rechokeSlots; ++i) {
+				peers[i].isChoked = false;
+				if (peers[i].interested) ++unchokeInterested;
+			}
+
+			if (!rechokeOptimistic && i < peers.length && rechokeSlots) {
+				var candidates = peers.slice(i).filter(function(peer) { return peer.interested; });
+				var optimistic = candidates[(Math.random() * candidates.length) | 0];
+
+				if (optimistic) {
+					optimistic.isChoked = false;
+					rechokeOptimistic = optimistic.wire;
+					rechokeOptimisticTime = RECHOKE_OPTIMISTIC_DURATION;
+				}
+			}
+
+			peers.forEach(function(peer) {
+				if (peer.wasChoked != peer.isChoked) {
+					if (peer.isChoked) peer.wire.choke();
+					else peer.wire.unchoke();
+				}
+			});
 		};
 
 		var onready = function() {
@@ -448,6 +560,8 @@ var torrentStream = function(link, opts) {
 				oninterestchange();
 				onupdate();
 			};
+
+			rechokeIntervalId = setInterval(onrechoke, RECHOKE_INTERVAL);
 
 			engine.emit('ready');
 			refresh();
@@ -494,7 +608,7 @@ var torrentStream = function(link, opts) {
 					return;
 				}
 
-				if (!(piece >= 0)) return;
+				if (piece < 0) return;
 				if (message.msg_type === 2) return;
 
 				if (message.msg_type === 0) {
@@ -524,10 +638,14 @@ var torrentStream = function(link, opts) {
 					result['announce-list'] = [];
 
 					var buf = bncode.encode(result);
-					fs.writeFile(torrentPath, buf, function() {
-						ontorrent(parseTorrent(buf));
+					ontorrent(parseTorrent(buf));
+
+					mkdirp(path.dirname(torrentPath), function(err) {
+						if (err) return engine.emit('error', err);
+						fs.writeFile(torrentPath, buf, function(err) {
+							if (err) engine.emit('error', err);
+						});
 					});
-					return;
 				}
 			});
 
@@ -547,24 +665,33 @@ var torrentStream = function(link, opts) {
 	});
 
 	swarm.pause();
-	mkdirp(opts.path, function(err) {
-		if (err) return engine.emit('error', err);
 
-		if (link.files) {
-			metadata = encode(link);
-			swarm.resume();
-			if (metadata) ontorrent(link);
-			return;
-		}
-
+	if (link.files) {
+		metadata = encode(link);
+		swarm.resume();
+		if (metadata) ontorrent(link);
+	} else {
 		fs.readFile(torrentPath, function(_, buf) {
+			if (destroyed) return;
 			swarm.resume();
-			if (!buf) return;
+			if (!buf) {
+				/* 
+				We know only infoHash here, not full infoDictionary.
+				But infoHash is enough to connect to trackers and get peers.
+				*/
+				process.nextTick(function() {
+					// let execute engine.listen() before createTracker()
+					if (!engine.tracker) {
+						engine.tracker = createTracker(link);
+					}
+				});
+				return;
+			}
 			var torrent = parseTorrent(buf);
 			metadata = encode(torrent);
 			if (metadata) ontorrent(torrent);
 		});
-	});
+	}
 
 	engine.critical = function(piece, width) {
 		for (var i = 0; i < (width || 1); i++) critical[piece+i] = true;
@@ -607,12 +734,42 @@ var torrentStream = function(link, opts) {
 		swarm.remove(addr);
 	};
 
-	engine.remove = function(cb) {
-		rimraf(engine.path, cb || noop);
+	var removeTorrent = function(cb) {
+		fs.unlink(torrentPath, function(err) {
+			if (err) return cb(err);
+			fs.rmdir(path.dirname(torrentPath), function(err) {
+				if (err && err.code !== 'ENOTEMPTY') return cb(err);
+				cb();
+			});
+		});
+	};
+
+	var removeTmp = function(cb) {
+		if (!usingTmp) return removeTorrent(cb);
+		fs.rmdir(opts.path, function(err) {
+			if (err) return cb(err);
+			removeTorrent(cb);
+		});
+	};
+
+	engine.remove = function(keepPieces, cb) {
+		if (typeof keepPieces === "function") {
+			cb = keepPieces;
+			keepPieces = false;
+		}
+
+		if (keepPieces || !engine.store) return removeTmp(cb);
+
+		engine.store.remove(function(err) {
+			if (err) return cb(err);
+			removeTmp(cb);
+		});
 	};
 
 	engine.destroy = function(cb) {
+		destroyed = true;
 		swarm.destroy();
+		clearInterval(rechokeIntervalId);
 		if (engine.tracker) engine.tracker.stop();
 		if (engine.dht) engine.dht.close();
 		if (engine.store) {
@@ -623,9 +780,12 @@ var torrentStream = function(link, opts) {
 	};
 
 	engine.listen = function(port, cb) {
-		if (typeof port === 'function') return that.listen(0, port);
+		if (typeof port === 'function') return engine.listen(0, port);
 		engine.port = port || DEFAULT_PORT;
 		swarm.listen(engine.port, cb);
+
+		if (engine.tracker) engine.tracker.stop();
+		if (engine.torrent) engine.tracker = createTracker(engine.torrent);
 	};
 
 	return engine;

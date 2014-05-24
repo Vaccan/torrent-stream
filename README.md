@@ -16,7 +16,6 @@ torrent-stream is a node module that allows you to access files inside a torrent
 
 ``` js
 var torrentStream = require('torrent-stream');
-var fs = require('fs');
 
 var engine = torrentStream('magnet:my-magnet-link');
 
@@ -54,13 +53,23 @@ Create a new engine instance. Options can contain the following
 ``` js
 {
 	connections: 100,     // Max amount of peers to be connected to.
-	path: '/tmp/my-file', // Where to save the buffer data.
+	uploads: 10,          // Number of upload slots.
+	tmp: '/tmp',          // Root folder for the files storage.
+	                      // Defaults to '/tmp' or temp folder specific to your OS.
+	                      // Each torrent will be placed into a separate folder under /tmp/torrent-stream/{infoHash}
+	path: '/tmp/my-file', // Where to save the files. Overrides `tmp`.
 	verify: true,         // Verify previously stored data before starting
 	                      // Defaults to true
 	dht: 10000,           // Use DHT to initialize the swarm.
 	                      // Defaults to 10000 peers, set false to disable
-	tracker: true         // Whether or not to use a tracker
+	tracker: true,        // Whether or not to use trackers from torrent file or magnet link
 	                      // Defaults to true
+	trackers: [
+	    'udp://tracker.openbittorrent.com:80',
+	    'udp://tracker.ccc.de:80'
+	]
+	                      // Allows to declare additional custom trackers to use
+	                      // Defaults to empty
 }
 ```
 
@@ -81,7 +90,7 @@ Emitted everytime a piece is uploaded.
 
 An array of all files in the torrent. See the file section for more info on what methods the file has
 
-#### `engine.destroy()`
+#### `engine.destroy(cb)`
 
 Destroy the engine. Destroys all connections to peers
 
@@ -93,9 +102,10 @@ Connect to a peer manually
 
 Disconnect from a peer manually
 
-#### `engine.remove(cb)`
+#### `engine.remove([keep-pieces], cb)`
 
-Completely remove all saved data for this torrent
+Completely remove all saved data for this torrent.
+Optionally, only remove cache and temporary data but keep downloaded pieces
 
 #### `engine.listen([port], cb)`
 
